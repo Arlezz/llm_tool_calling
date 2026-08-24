@@ -5,7 +5,6 @@ Deliberately does not fetch or scrape the URLs it returns; that is a separate, l
 
 import json
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -13,11 +12,9 @@ from typing import Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from ddgs import DDGS
-from mlx_lm import load, stream_generate
-from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler
 
-from prompt import QUERY_GEN_SYSTEM_PROMPT
+from app import llm_client
+from app.prompt import QUERY_GEN_SYSTEM_PROMPT
 
 WEB_SEARCH_TIMEOUT = 10  # seconds, per individual query
 MAX_QUERIES = 3  # queries generated per search
@@ -26,20 +23,9 @@ MAX_SOURCES = 10  # final sources returned per search
 MAX_RESULTS_PER_DOMAIN = 2  # domain diversity cap on the final sources
 QUERY_GEN_MAX_TOKENS = 256  # short JSON output, no need for a large budget
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 _TRACKING_PARAM_PREFIXES = ("utm_",)
 _TRACKING_PARAMS = {"gclid", "fbclid", "mc_cid", "mc_eid", "igshid"}
-
-model, tokenizer = load("mlx-community/Qwen3-14B-4bit")
-# Qwen3 thinking-mode recommended sampling: temp=0.6, top_p=0.95, top_k=20, min_p=0.
-sampler = make_sampler(temp=0.6, top_p=0.95, top_k=20, min_p=0.0)
-
-# Guards concurrent access to the shared MLX model: main.py's REPL is single-threaded, but an API
-# server can receive concurrent requests. Also held by agent.py for the whole duration of a
-# tool-calling turn (see agent.run_tool_calling_loop), since a turn can span several generate
-# calls sharing one cache that must not interleave with another concurrent turn.
-model_lock = threading.Lock()
 
 
 @dataclass
@@ -84,12 +70,8 @@ class DDGSSearchEngine:
         return parsed
 
 
-def _strip_think(text):
-    return _THINK_RE.sub("", text)
-
-
 def _parse_queries(text, max_queries):
-    match = _JSON_OBJECT_RE.search(_strip_think(text))
+    match = _JSON_OBJECT_RE.search(text)
     if not match:
         return None
     try:
@@ -118,27 +100,17 @@ def _parse_queries(text, max_queries):
 
 
 def generate_queries(question, max_queries):
-    """Nested one-shot Qwen call: expands `question` into up to `max_queries` search queries.
-
-    Uses its own ephemeral prompt cache, separate from the main conversation's cache.
-    """
-    prompt = tokenizer.apply_chat_template(
+    """One-shot call to the model server: expands `question` into up to `max_queries` search
+    queries. Non-streaming, thinking disabled - this just needs a short JSON reply."""
+    response = llm_client.chat(
         [
             {"role": "system", "content": QUERY_GEN_SYSTEM_PROMPT.format(max_queries=max_queries)},
             {"role": "user", "content": question},
         ],
-        add_generation_prompt=True,
         enable_thinking=False,
+        max_tokens=QUERY_GEN_MAX_TOKENS,
     )
-
-    cache = make_prompt_cache(model)
-    text = ""
-    with model_lock:
-        for response in stream_generate(
-            model, tokenizer, prompt=prompt, sampler=sampler, prompt_cache=cache,
-            max_tokens=QUERY_GEN_MAX_TOKENS,
-        ):
-            text += response.text
+    text = response.choices[0].message.content or ""
 
     queries = _parse_queries(text, max_queries)
     if queries is None:

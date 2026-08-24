@@ -1,39 +1,41 @@
 """The tool-calling agent: understands the question, decides whether/how to search, evaluates
 results, refines and iterates via the `web_search` tool, and eventually concludes.
 
+Talks to the model through llm_client (a natively-running mlx_lm.server), not in-process - so this
+module itself has no Apple Silicon/Metal dependency and can run anywhere, containerized or not.
+
 Two entry points share this loop:
-- main.py's REPL, which keeps one `cache` across turns (conversation memory).
-- run_agent_turn(), a stateless one-shot turn (fresh cache) used by the HTTP API.
+- main.py's REPL, which keeps one `messages` list across turns (conversation memory).
+- run_agent_turn(), a stateless one-shot turn (fresh `messages`) used by the HTTP API.
 """
 
 import contextvars
 import json
 import re
 import traceback
+import uuid
 from datetime import datetime
 from urllib.parse import urlparse
 
-import mlx.core as mx
-from mlx_lm import stream_generate
-from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+from app import llm_client
+from app.prompt import AGENT_SYSTEM_PROMTP
+from app.search import MAX_SOURCES, normalize_url, run_search
 
-from prompt import AGENT_SYSTEM_PROMTP
-from search import (
-    MAX_SOURCES,
-    model,
-    model_lock,
-    normalize_url,
-    run_search,
-    sampler,
-    tokenizer,
-)
-
-MAX_KV_SIZE = None
-MAX_TOKENS = 2048  # enable_thinking burns tokens on <think> before it ever reaches a tool_call/answer
+MAX_TOKENS = 2048
 MAX_TOOL_ROUNDS = 8  # safety cap on consecutive tool calls within a single user turn
 
-TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+# Matches the shape of the fabricated-citation failures caught during testing (fake URLs, "según
+# X", "according to Y") - not any factual-sounding text in general. A plain conversational reply
+# (greeting, thanks, small talk) never matches this, so it's never forced into a pointless search.
+_UNVERIFIED_CLAIM_RE = re.compile(
+    r"https?://|www\.\w|seg[uú]n\b|fuentes?\s*[:\-]|confirmad[oa]s?\s+por|de acuerdo (a|con)\b|"
+    r"according to|sources?\s*[:\-]|confirmed by|studies show|data from",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unverified_claim(content):
+    return bool(content) and bool(_UNVERIFIED_CLAIM_RE.search(content))
 
 # Populated only during run_agent_turn(): the raw {"status","sources"} dict from every
 # web_search call made in this turn, so the API can build its own {"status","sources"} response
@@ -125,70 +127,62 @@ def validate_arguments(schema, arguments):
     return None
 
 
-def new_cache():
-    """Fresh KV cache primed with the system prompt + tool defs (encoded once)."""
-    cache = make_prompt_cache(model, MAX_KV_SIZE)
+def new_conversation():
+    """Fresh conversation: just the system prompt. Tools are passed per-request (see
+    generate_from_model), not baked into the prompt text."""
     current_date = datetime.now().astimezone().date().isoformat()
-    system_content = AGENT_SYSTEM_PROMTP.format(current_date=current_date)
-    system_prompt = tokenizer.apply_chat_template(
-        [{"role": "system", "content": system_content}],
-        tools=TOOLS,
-        add_generation_prompt=False,
-    )
-    mx.eval(model(mx.array(system_prompt)[None], cache=cache))
-    return cache
+    return [{"role": "system", "content": AGENT_SYSTEM_PROMTP.format(current_date=current_date)}]
 
 
-def generate_from_model(prompt, cache):
-    """Stream a response and return (text, last_response) so callers can inspect finish_reason.
+def generate_from_model(messages):
+    """Streams one assistant turn from the model server.
 
-    Holds `model_lock` for just this one generate call (not the whole turn): the shared MLX
-    `model` must not be invoked from two threads at once, but each call here uses its own
-    `cache`, so calls don't need to stay serialized beyond that. A turn can itself trigger a
-    nested generate call (search.generate_queries, inside a web_search tool execution) which
-    takes the same lock again *after* this one has already been released - locking the whole
-    turn instead would deadlock on that reentry, since threading.Lock isn't reentrant.
+    Returns (assistant_message, finish_reason). assistant_message is an OpenAI-style dict
+    ({"role": "assistant", "content": str | None, "tool_calls": [...]}) ready to append to
+    `messages` or to hand to a caller inspecting tool_calls. Prints content and reasoning
+    (<think>) live as they stream, same as the raw text used to look before the model server.
     """
-    text = ""
-    last_response = None
-    with model_lock:
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt=prompt,
-            sampler=sampler,
-            prompt_cache=cache,
-            max_tokens=MAX_TOKENS,
-        ):
-            print(response.text, end="", flush=True)
-            text += response.text
-            last_response = response
+    stream = llm_client.chat(messages, tools=TOOLS, stream=True, enable_thinking=True, max_tokens=MAX_TOKENS)
+
+    content = ""
+    tool_calls = {}
+    finish_reason = None
+
+    for chunk in stream:
+        choice = chunk.choices[0]
+        delta = choice.delta
+        finish_reason = choice.finish_reason or finish_reason
+
+        reasoning = getattr(delta, "reasoning", None)
+        if reasoning:
+            print(reasoning, end="", flush=True)
+        if delta.content:
+            print(delta.content, end="", flush=True)
+            content += delta.content
+
+        for tc_delta in delta.tool_calls or []:
+            entry = tool_calls.setdefault(
+                tc_delta.index, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if tc_delta.id:
+                entry["id"] = tc_delta.id
+            if tc_delta.function:
+                if tc_delta.function.name:
+                    entry["function"]["name"] += tc_delta.function.name
+                if tc_delta.function.arguments:
+                    entry["function"]["arguments"] += tc_delta.function.arguments
+
     print()
-    return text, last_response
 
+    message = {"role": "assistant", "content": content or None}
+    if tool_calls:
+        ordered = [tool_calls[i] for i in sorted(tool_calls)]
+        for tc in ordered:
+            if not tc["id"]:
+                tc["id"] = f"call_{uuid.uuid4().hex[:8]}"
+        message["tool_calls"] = ordered
 
-def strip_think(text):
-    """Drop <think>...</think> blocks so we never mistake reasoning-about-tools for a real call."""
-    return THINK_RE.sub("", text)
-
-
-def response_is_tool_call(response):
-    return bool(TOOL_CALL_RE.search(response))
-
-
-def has_incomplete_tool_call(response):
-    """True if there's a dangling <tool_call> the model never closed (not caught by finish_reason=="length")."""
-    return response.count("<tool_call>") > response.count("</tool_call>")
-
-
-def extract_tool_calls(response):
-    calls = []
-    for match in TOOL_CALL_RE.finditer(response):
-        try:
-            calls.append(json.loads(match.group(1)))
-        except json.JSONDecodeError:
-            print(f"[tool] malformed tool_call JSON: {match.group(1)!r}")
-    return calls
+    return message, finish_reason
 
 
 def normalize_call(call):
@@ -218,12 +212,14 @@ def execute_tool(call):
         return f"Error: tool '{name}' failed unexpectedly. Try a different query or approach."
 
 
-def run_tool_calling_loop(prompt, cache, question):
+def run_tool_calling_loop(messages, question):
     """Runs the tool-calling loop for one turn until a final answer or the usual limits.
 
-    `question` is the original user question (plain text, not yet templated) for this turn. It is
-    only used for the forced-search safety net below - the loop otherwise just keeps re-templating
-    tool results into the next `prompt` as usual.
+    Mutates `messages` in place, appending the assistant/tool messages generated this turn - the
+    REPL's persistent conversation naturally accumulates history across turns this way.
+
+    `question` is the original user question for this turn, used only for the forced-search
+    safety net below.
 
     Returns (final_text | None, truncated: bool). final_text is None if truncated or if the
     round limit was hit without a final answer.
@@ -231,44 +227,51 @@ def run_tool_calling_loop(prompt, cache, question):
     tool_rounds = 0
     seen_calls = set()
     while True:
-        response, last_response = generate_from_model(prompt, cache)
+        assistant_message, finish_reason = generate_from_model(messages)
 
-        if last_response is not None and last_response.finish_reason == "length":
-            trimmed = trim_prompt_cache(cache, last_response.generation_tokens)
+        if finish_reason == "length":
             print(
-                f"[warn] Respuesta truncada por max_tokens; se recortaron {trimmed} "
-                "tokens del cache. Intenta reformular la pregunta.\n"
+                "[warn] Respuesta truncada por max_tokens. Intenta reformular la pregunta.\n"
             )
             return None, True
 
-        clean_response = strip_think(response)
-        if not response_is_tool_call(clean_response):
-            if tool_rounds > 0:
-                return clean_response, False
+        tool_calls = assistant_message.get("tool_calls")
 
-            # The model never called web_search this turn despite being instructed to
-            # prioritize it - an instruction is never a hard guarantee, and it can (and did,
-            # during testing) answer confidently while fabricating citations. Roll back this
-            # ungrounded answer and force a real search before letting it conclude.
+        if not tool_calls:
+            content = assistant_message.get("content")
+
+            if tool_rounds > 0 or not _looks_like_unverified_claim(content):
+                # Either already searched this turn, or this reply has nothing citation-like to
+                # verify (greeting, thanks, small talk, a question about the assistant itself) -
+                # trust the model's judgment that no search was needed.
+                messages.append(assistant_message)
+                return content, False
+
+            # The model asserted facts/citations (URLs, "según X") without ever calling
+            # web_search this turn - an instruction to prioritize search is never a hard
+            # guarantee, and it can (and did, during testing) answer confidently while
+            # fabricating citations. Don't keep this ungrounded answer; force a real search
+            # before letting it conclude.
             print(
-                "[warn] El modelo respondió sin buscar; se fuerza una búsqueda real antes de "
-                "confirmar la respuesta.\n"
+                "[warn] El modelo hizo afirmaciones sin respaldo real; se fuerza una búsqueda "
+                "antes de confirmar la respuesta.\n"
             )
-            trim_prompt_cache(cache, last_response.generation_tokens)
             tool_rounds += 1
-
-            call = {"name": "web_search", "arguments": {"query": question}}
-            print(f"[tool] {call['name']}({call['arguments']}) [forced]")
-            result = execute_tool(call)
+            call_id = f"call_{uuid.uuid4().hex[:8]}"
+            print(f"[tool] web_search({{'query': {question!r}}}) [forced]")
+            result = execute_tool({"name": "web_search", "arguments": {"query": question}})
             print(f"[tool result] {result}\n")
-
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "tool", "content": result}], add_generation_prompt=True, enable_thinking=True
-            )
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": json.dumps({"query": question})},
+                }],
+            })
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
             continue
-
-        if has_incomplete_tool_call(clean_response):
-            print("[warn] Se detectó un <tool_call> sin cerrar; se ignora esa parte.\n")
 
         tool_rounds += 1
         if tool_rounds > MAX_TOOL_ROUNDS:
@@ -278,10 +281,19 @@ def run_tool_calling_loop(prompt, cache, question):
             )
             return None, False
 
-        tool_messages = []
-        for call in extract_tool_calls(clean_response):
-            print(f"[tool] {call.get('name')}({call.get('arguments')})")
+        messages.append(assistant_message)
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            try:
+                arguments = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                print(f"[tool] {name}({tc['function']['arguments']!r}) [malformed JSON]")
+                result = f"Error: invalid arguments for '{name}': not valid JSON."
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                continue
 
+            print(f"[tool] {name}({arguments})")
+            call = {"name": name, "arguments": arguments}
             call_key = normalize_call(call)
             if call_key in seen_calls:
                 result = (
@@ -294,11 +306,7 @@ def run_tool_calling_loop(prompt, cache, question):
                 result = execute_tool(call)
 
             print(f"[tool result] {result}\n")
-            tool_messages.append({"role": "tool", "content": result})
-
-        prompt = tokenizer.apply_chat_template(
-            tool_messages, add_generation_prompt=True, enable_thinking=True
-        )
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
 
 
 def _aggregate_sources(raw_results):
@@ -330,22 +338,22 @@ def _aggregate_sources(raw_results):
 
 
 def run_agent_turn(question):
-    """Stateless one-shot agent turn: fresh cache, no memory across calls. Used by the HTTP API.
+    """Stateless one-shot agent turn: fresh conversation, no memory across calls. Used by the
+    HTTP API.
 
     Runs the same understand -> decide -> search -> evaluate -> iterate -> conclude loop as the
     REPL, and returns the sources gathered along the way instead of the free-text final answer.
-    run_tool_calling_loop guarantees at least one real web_search call per turn (forcing one if
-    the model concludes without searching), so not_found here always means "searched, found
-    nothing", never "didn't bother searching".
+    run_tool_calling_loop forces a real web_search if the model asserts unverified facts/citations
+    without ever searching, but trusts it when it has nothing citation-like to verify (e.g. the
+    query itself is conversational, not a real research question) - so not_found here can mean
+    either "searched, found nothing" or "didn't need to search at all".
     """
-    cache = new_cache()
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": question}], add_generation_prompt=True, enable_thinking=True,
-    )
+    messages = new_conversation()
+    messages.append({"role": "user", "content": question})
 
     token = _collected_sources.set([])
     try:
-        run_tool_calling_loop(prompt, cache, question)
+        run_tool_calling_loop(messages, question)
         raw_results = _collected_sources.get()
     finally:
         _collected_sources.reset(token)

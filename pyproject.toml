@@ -7,6 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
     "ddgs>=9.15.0",
     "fastapi>=0.115",
-    "mlx-lm>=0.31.3",
+    "openai>=1.50",
     "uvicorn[standard]>=0.32",
 ]
+
+[project.optional-dependencies]
+server = ["mlx-lm>=0.31.3"]

@@ -1,0 +1,12 @@
+services:
+  search-api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # The model runs natively on the host (Metal/Apple Silicon, see README) - this points the
+      # container at it. host.docker.internal resolves to the host from inside the container on
+      # Docker Desktop (Mac/Windows); extra_hosts below makes the same name work on Linux hosts.
+      - MODEL_SERVER_URL=http://host.docker.internal:8080/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

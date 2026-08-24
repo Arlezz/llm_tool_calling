@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator
 
-from agent import run_agent_turn
+from app.agent import run_agent_turn
 
 app = FastAPI(title="Web Search API")
 
