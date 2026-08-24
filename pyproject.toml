@@ -1,0 +1,12 @@
+[project]
+name = "llm-tool-calling"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ddgs>=9.15.0",
+    "fastapi>=0.115",
+    "mlx-lm>=0.31.3",
+    "uvicorn[standard]>=0.32",
+]
